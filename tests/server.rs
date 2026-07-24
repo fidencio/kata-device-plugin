@@ -13,7 +13,7 @@ use kata_device_plugin::dp::v1beta1::{
     PreStartContainerRequest, PreferredAllocationRequest, RegisterRequest,
 };
 use kata_device_plugin::plugin::DeviceServer;
-use kata_device_plugin::vfio::{Resource, RESOURCES};
+use kata_device_plugin::vfio::Naming;
 use pcilibs_rs::testfs::add as add_dev;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -59,14 +59,9 @@ fn fake_vfio(n: u32) -> TempDir {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("devices")).unwrap();
     for i in 0..n {
-        add_dev(dir.path(), i, "0x10de", "0x030200");
+        add_dev(dir.path(), i, "0x10de", "0x2330", "0x030200");
     }
     dir
-}
-
-/// Look up a row from the plugin's real resource table.
-fn resource(name: &str) -> Resource {
-    *RESOURCES.iter().find(|r| r.name == name).unwrap()
 }
 
 async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<Channel> {
@@ -99,6 +94,10 @@ struct Node {
 
 impl Node {
     async fn start(vfio: TempDir, resources: &[&str]) -> Node {
+        Self::start_with(vfio, resources, Naming::Alias).await
+    }
+
+    async fn start_with(vfio: TempDir, resources: &[&str], naming: Naming) -> Node {
         let sockets = TempDir::new().unwrap();
         let cdi = TempDir::new().unwrap();
         let registered = Arc::new(Mutex::new(None));
@@ -121,7 +120,8 @@ impl Node {
             .iter()
             .map(|name| {
                 let server = DeviceServer::new(
-                    resource(name),
+                    name,
+                    naming,
                     vfio.path().to_str().unwrap(),
                     vfio.path().join("sysfs").to_str().unwrap(),
                     sockets.path().to_str().unwrap(),
@@ -315,7 +315,7 @@ async fn devices_appearing_after_startup_are_published() {
     assert_eq!(first.devices.len(), 0, "must start with zero devices");
 
     // Simulate the VFIO cdev appearing after the DP is already running.
-    add_dev(node._vfio.path(), 0, "0x10de", "0x030200");
+    add_dev(node._vfio.path(), 0, "0x10de", "0x2330", "0x030200");
 
     // The poller ticks every POLL_INTERVAL (5 s).  Time is paused
     // (start_paused), so the tick auto-advances as soon as the runtime idles;
@@ -356,7 +356,7 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
         .contains("vfio0"));
 
     remove_dev(node._vfio.path(), 0);
-    add_dev(node._vfio.path(), 5, "0x10de", "0x030200");
+    add_dev(node._vfio.path(), 5, "0x10de", "0x2330", "0x030200");
 
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
         .await
@@ -431,7 +431,7 @@ async fn cdi_write_failure_is_retried_next_tick() {
     let spec_path = node.cdi.path().join("kata.nvidia.com-gpu.yaml");
     std::fs::remove_file(&spec_path).unwrap();
     std::fs::create_dir(&spec_path).unwrap();
-    add_dev(node._vfio.path(), 1, "0x10de", "0x030200");
+    add_dev(node._vfio.path(), 1, "0x10de", "0x2330", "0x030200");
 
     // The device update must reach the kubelet even while the CDI write fails.
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
@@ -475,7 +475,8 @@ async fn registration_failure_is_not_fatal() {
     let cdi = TempDir::new().unwrap();
 
     let server = DeviceServer::new(
-        resource("nvidia.com/gpu"),
+        "nvidia.com/gpu",
+        Naming::Alias,
         vfio.path().to_str().unwrap(),
         vfio.path().join("sysfs").to_str().unwrap(),
         sockets.path().to_str().unwrap(),
@@ -507,6 +508,40 @@ async fn registration_failure_is_not_fatal() {
 }
 
 #[tokio::test]
+async fn sku_mode_serves_under_the_sku_name() {
+    // End to end under a SKU-resolved name: socket, registration, CDI spec
+    // file, and device IDs must all follow the resolved name, not the row.
+    let vfio = fake_vfio(2);
+    let name =
+        kata_device_plugin::vfio::discover(vfio.path(), &vfio.path().join("sysfs"), Naming::Sku)
+            .into_keys()
+            .next()
+            .expect("two H100 cdevs resolve to one SKU name");
+    assert!(name.starts_with("nvidia.com/GH100"), "{name}");
+
+    let sock = format!("kata-{}.sock", name.rsplit('/').next().unwrap());
+    let node = Node::start_with(vfio, &[name.as_str()], Naming::Sku).await;
+
+    let reg = node
+        .registered
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("plugin did not register");
+    assert_eq!(reg.resource_name, name);
+
+    let (_stream, resp) = node.snapshot(&sock).await;
+    assert_eq!(resp.devices.len(), 2);
+
+    let spec_file = format!("kata.{}.yaml", name.replace('/', "-"));
+    let spec = node.spec(&spec_file).expect("CDI spec under the SKU name");
+    assert!(spec.contains(&format!("kind: {name}")));
+    assert!(spec.contains("devices/vfio0") && spec.contains("devices/vfio1"));
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
 async fn grpc_stubs_respond() {
     // GetPreferredAllocation and PreStartContainer are protocol stubs; the
     // kubelet may still call them, so they must answer instead of erroring.
@@ -531,12 +566,12 @@ async fn gpu_and_nvswitch_filtered_by_pci_class() {
     // no RESOURCES row and must not be advertised anywhere.
     let vfio = TempDir::new().unwrap();
     for i in 0..2 {
-        add_dev(vfio.path(), i, "0x10de", "0x030200");
+        add_dev(vfio.path(), i, "0x10de", "0x2330", "0x030200");
     }
     for i in 2..5 {
-        add_dev(vfio.path(), i, "0x10de", "0x068000");
+        add_dev(vfio.path(), i, "0x10de", "0x22a3", "0x068000");
     }
-    add_dev(vfio.path(), 5, "0x15b3", "0x020000");
+    add_dev(vfio.path(), 5, "0x15b3", "0x101e", "0x020000");
 
     let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
 

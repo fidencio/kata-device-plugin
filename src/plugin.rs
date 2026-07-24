@@ -11,7 +11,7 @@ use tower::service_fn;
 use tracing::info;
 
 use crate::cdi;
-use crate::vfio::{self, Resource};
+use crate::vfio::{self, Naming};
 
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -32,7 +32,7 @@ pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
 pub const CDI_DIR: &str = "/var/run/cdi";
 
 /// How often ListAndWatch re-scans /dev/vfio/devices/.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Every resource needs its own socket in the kubelet's shared plugin dir:
 /// "nvidia.com/gpu" → "kata-gpu.sock".
@@ -41,10 +41,13 @@ fn socket_name(resource_name: &str) -> String {
     format!("kata-{base}.sock")
 }
 
-/// Single concrete device plugin; tonic requires Clone.
+/// Single concrete device plugin; tonic requires Clone.  One server per
+/// resolved resource name — a RESOURCES row name in alias mode, a SKU name
+/// like "nvidia.com/GH100_H100_SXM5_80GB" in sku mode.
 #[derive(Clone)]
 pub struct DeviceServer {
-    resource: Resource,
+    name: String,
+    naming: Naming,
     // Path fields rather than the constants so tests can inject temp dirs.
     device_dir: PathBuf,
     sysfs_dir: PathBuf,
@@ -54,14 +57,16 @@ pub struct DeviceServer {
 
 impl DeviceServer {
     pub fn new(
-        resource: Resource,
+        name: &str,
+        naming: Naming,
         device_dir: &str,
         sysfs_dir: &str,
         socket_dir: &str,
         cdi_dir: &str,
     ) -> Self {
         Self {
-            resource,
+            name: name.to_owned(),
+            naming,
             device_dir: PathBuf::from(device_dir),
             sysfs_dir: PathBuf::from(sysfs_dir),
             socket_dir: PathBuf::from(socket_dir),
@@ -69,15 +74,23 @@ impl DeviceServer {
         }
     }
 
+    /// This server's devices under the current scan: the discover() group
+    /// matching our resolved name.
+    fn my_devices(&self) -> Vec<vfio::IommufdDev> {
+        vfio::discover(&self.device_dir, &self.sysfs_dir, self.naming)
+            .remove(&self.name)
+            .unwrap_or_default()
+    }
+
     pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
-        let sock_name = socket_name(self.resource.name);
+        let sock_name = socket_name(&self.name);
         let socket = self.socket_dir.join(&sock_name);
         let _ = tokio::fs::remove_file(&socket).await;
         let stream = UnixListenerStream::new(
             UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?,
         );
 
-        info!(resource = self.resource.name, socket = %socket.display(), "plugin server starting");
+        info!(resource = %self.name, socket = %socket.display(), "plugin server starting");
 
         // Serve first, register after: the kubelet dials back and probes the
         // endpoint inside the Register RPC itself, so registering before the
@@ -93,7 +106,7 @@ impl DeviceServer {
             .join("kubelet.sock")
             .to_string_lossy()
             .into_owned();
-        if let Err(e) = register(&kubelet, self.resource.name, &sock_name).await {
+        if let Err(e) = register(&kubelet, &self.name, &sock_name).await {
             tracing::warn!("kubelet registration failed: {e:#}");
         }
 
@@ -109,7 +122,7 @@ impl DeviceServer {
         // remain on disk if the node is reconfigured while the plugin is absent.
         // On crash the file stays, but the ListAndWatch poller replaces it from
         // a fresh scan on the kubelet's first call after restart.
-        let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
+        let cdi_file = cdi::spec_path(&self.cdi_dir, &self.name);
         match tokio::fs::remove_file(&cdi_file).await {
             Ok(()) => info!(path = %cdi_file.display(), "removed CDI spec on shutdown"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -127,17 +140,17 @@ impl DeviceServer {
     /// on the next tick, Allocate fails the RPC.
     async fn sync_cdi_spec(&self, devs: &[vfio::IommufdDev]) -> anyhow::Result<()> {
         if devs.is_empty() {
-            let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
+            let cdi_file = cdi::spec_path(&self.cdi_dir, &self.name);
             match tokio::fs::remove_file(&cdi_file).await {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e).with_context(|| format!("remove {}", cdi_file.display())),
             }
         } else {
-            let name = self.resource.name;
+            let name = self.name.clone();
             let devs = devs.to_vec();
             let dir = self.cdi_dir.clone();
-            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(name, &devs, &dir))
+            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(&name, &devs, &dir))
                 .await
                 .context("CDI spec write task")?
         }
@@ -209,8 +222,7 @@ impl DevicePlugin for DeviceServer {
                     break;
                 }
 
-                let vfio_devs =
-                    vfio::enumerate(&server.device_dir, &server.sysfs_dir, &server.resource);
+                let vfio_devs = server.my_devices();
                 // Compare the backing cdev numbers, not the advertised Device
                 // list: IDs are just indices 0..n, so a same-count swap
                 // (vfio7 gone, vfio9 new) would look identical to the kubelet
@@ -227,7 +239,7 @@ impl DevicePlugin for DeviceServer {
                 if Some(&nums) != sent.as_ref() {
                     info!(
                         count = nums.len(),
-                        resource = server.resource.name,
+                        resource = %server.name,
                         "device list changed"
                     );
                     let devices = (0..nums.len())
@@ -264,11 +276,11 @@ impl DevicePlugin for DeviceServer {
         &self,
         req: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
-        let resource_name = self.resource.name;
+        let resource_name = &self.name;
         // The device set can shrink between scheduling and Allocate.  Check
         // the requested IDs against a fresh enumeration so a stale ID fails
         // loudly here instead of as an unresolvable CDI name in the shim.
-        let devs = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
+        let devs = self.my_devices();
         let present = devs.len();
         // The names below only work if the shim can resolve them at
         // SandboxCreate.  Sync the spec from the very enumeration we validate
