@@ -2,9 +2,59 @@
 
 use kata_device_plugin::{plugin, vfio};
 
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
 use plugin::DeviceServer;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
+
+/// The one flag.  An argument templates directly in the DaemonSet spec, so
+/// no config file or ConfigMap returns (KISS).
+fn parse_naming() -> anyhow::Result<vfio::Naming> {
+    let mut naming = vfio::Naming::Alias;
+    for arg in std::env::args().skip(1) {
+        match arg.strip_prefix("--resource-naming=").map(str::trim) {
+            Some(value) => naming = vfio::Naming::parse(value).map_err(anyhow::Error::msg)?,
+            None => anyhow::bail!("usage: kata-device-plugin [--resource-naming=alias|sku]"),
+        }
+    }
+    Ok(naming)
+}
+
+/// Spawn one DeviceServer for `name`.  The task removes itself from
+/// `running` on exit, so a server that dies (bind failure, transient FS
+/// error) is respawned by the rescan loop instead of being lost until the
+/// pod restarts.
+fn spawn_server(
+    name: &str,
+    naming: vfio::Naming,
+    shutdown: &CancellationToken,
+    running: &Arc<Mutex<HashSet<String>>>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    info!(resource = %name, "starting plugin");
+    let server = DeviceServer::new(
+        name,
+        naming,
+        vfio::VFIO_DIR,
+        vfio::SYSFS_DIR,
+        plugin::SOCKET_DIR,
+        plugin::CDI_DIR,
+    );
+    let token = shutdown.clone();
+    let label = name.to_owned();
+    let set = running.clone();
+    running.lock().unwrap().insert(name.to_owned());
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = server.run(token).await {
+            // {:#} keeps the error's cause chain; bare Display drops it.
+            tracing::warn!(resource = %label, "plugin error: {e:#}");
+        }
+        set.lock().unwrap().remove(&label);
+    }));
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,9 +64,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "kata_device_plugin=info".parse().unwrap()),
         )
         .init();
+    let naming = parse_naming()?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         commit = env!("GIT_SHA"),
+        naming = ?naming,
         "kata-device-plugin"
     );
 
@@ -28,32 +80,37 @@ async fn main() -> anyhow::Result<()> {
         sd.cancel();
     });
 
-    // Declared by the node, not configured: one server per RESOURCES row,
-    // started unconditionally.  Each ListAndWatch stream polls for VFIO
-    // devices and pushes updates as the bound set changes (0..n), so
-    // late-appearing devices (VFIO binding races the DP startup) are picked
-    // up without restarting the pod.
-    let servers: Vec<_> = vfio::RESOURCES
-        .iter()
-        .map(|res| {
-            info!(resource = res.name, "starting plugin");
-            DeviceServer::new(
-                *res,
-                vfio::VFIO_DIR,
-                vfio::SYSFS_DIR,
-                plugin::SOCKET_DIR,
-                plugin::CDI_DIR,
-            )
-        })
-        .collect();
+    let running: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let mut tasks = Vec::new();
 
-    let results =
-        futures::future::join_all(servers.into_iter().map(|s| s.run(shutdown.clone()))).await;
-    for res in results {
-        if let Err(e) = res {
-            // {:#} keeps the error's cause chain; bare Display drops it.
-            warn!("plugin error: {e:#}");
+    // Reconcile loop: spawn a server for every name that should exist but
+    // has none running.  Alias row names are always desired so the kubelet
+    // sees the resource (zero capacity included) regardless of deployment
+    // ordering; SKU names only exist once a device is discovered.  Servers
+    // are never stopped — a name whose devices vanish keeps advertising
+    // zero capacity via its own ListAndWatch poller.
+    loop {
+        let mut desired: Vec<String> = vfio::discover(
+            Path::new(vfio::VFIO_DIR),
+            Path::new(vfio::SYSFS_DIR),
+            naming,
+        )
+        .into_keys()
+        .collect();
+        if matches!(naming, vfio::Naming::Alias) {
+            desired.extend(vfio::RESOURCES.iter().map(|r| r.name.to_owned()));
+        }
+        for name in desired {
+            if !running.lock().unwrap().contains(&name) {
+                spawn_server(&name, naming, &shutdown, &running, &mut tasks);
+            }
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(plugin::POLL_INTERVAL) => {}
         }
     }
+
+    futures::future::join_all(tasks).await;
     Ok(())
 }

@@ -88,23 +88,17 @@ pub fn write_cdi_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfio::{self, testfs, Resource, RESOURCES};
+    use crate::vfio::{self, testfs, Naming};
     use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
-
-    fn by_name(name: &str) -> &'static Resource {
-        RESOURCES.iter().find(|r| r.name == name).unwrap()
-    }
 
     fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<IommufdDev> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
-        vfio::enumerate(
-            root.path(),
-            &testfs::sysfs(root.path()),
-            by_name("nvidia.com/gpu"),
-        )
+        vfio::discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias)
+            .remove("nvidia.com/gpu")
+            .unwrap_or_default()
     }
 
     #[test]
@@ -172,11 +166,9 @@ mod tests {
         for n in [3u32, 4] {
             testfs::add_nvswitch(root.path(), n);
         }
-        let devs = vfio::enumerate(
-            root.path(),
-            &testfs::sysfs(root.path()),
-            by_name("nvidia.com/nvswitch"),
-        );
+        let devs = vfio::discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias)
+            .remove("nvidia.com/nvswitch")
+            .unwrap_or_default();
 
         write_cdi_spec("nvidia.com/nvswitch", &devs, cdi_dir.path()).unwrap();
 
