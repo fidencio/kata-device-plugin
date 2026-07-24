@@ -18,9 +18,12 @@ spec:
     spec:
       priorityClassName: system-node-critical
 
-      # Only run on nodes where GFD has confirmed GPU presence.
+      # Only run where Kata is deployed (label written by kata-deploy).  GPU
+      # labels are useless here: on a passthrough node the device is
+      # VFIO-bound, so the host driver never loads and GFD never sees a GPU.
+      # Nodes without VFIO devices harmlessly advertise zero capacity.
       nodeSelector:
-        nvidia.com/gpu.present: "true"
+        katacontainers.io/kata-runtime: "true"
 
       # The plugin must start before workload pods on the node.
       tolerations:
