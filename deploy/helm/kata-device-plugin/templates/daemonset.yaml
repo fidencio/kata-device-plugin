@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: kata-device-plugin
+    app.kubernetes.io/name: kata-device-plugin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+spec:
+  selector:
+    matchLabels:
+      app: kata-device-plugin
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: kata-device-plugin
+        app.kubernetes.io/name: kata-device-plugin
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      priorityClassName: system-node-critical
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kata-device-plugin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.logFilter }}
+          env:
+            - name: RUST_LOG
+              value: {{ . | quote }}
+          {{- end }}
+
+          # No privileged flag, no added capabilities — ADR 10000.
+          securityContext:
+            allowPrivilegeEscalation: false
+            # All writes go to hostPath mounts (CDI specs, kubelet socket),
+            # which readOnlyRootFilesystem does not affect.
+            readOnlyRootFilesystem: true
+            runAsUser: 0                    # kubelet socket ownership requires uid 0
+            runAsNonRoot: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: [ALL]
+
+          volumeMounts:
+            - name: kubelet-socket
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi
+              mountPath: /var/run/cdi
+
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+      volumes:
+        - name: kubelet-socket
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate

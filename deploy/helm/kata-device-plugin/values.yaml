@@ -1,0 +1,31 @@
+# Only what genuinely varies per cluster is configurable.  The security
+# context, hostPath mounts, and priority class are kernel/kubelet/CDI
+# contracts baked into the template — overriding them produces a plugin
+# that does not work (see ARCHITECTURE.md, ADR 10000).
+
+image:
+  repository: ghcr.io/kata-containers/kata-device-plugin
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Only run on nodes where GFD has confirmed GPU presence.
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+
+# The plugin must start before workload pods on the node.
+tolerations:
+  - operator: Exists
+    effect: NoSchedule
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 20Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi
+
+# tracing_subscriber EnvFilter, e.g. "kata_device_plugin=debug".
+# Empty uses the binary's built-in default (kata_device_plugin=info).
+logFilter: ""

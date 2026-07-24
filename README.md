@@ -62,6 +62,16 @@ stream lifecycle, and CDI output are all covered without hardware.
 make deploy  # kubectl apply -f deploy/daemonset.yaml
 ```
 
+Or via Helm:
+
+```sh
+helm install kata-device-plugin deploy/helm/kata-device-plugin -n kube-system
+```
+
+The chart exposes only what varies per cluster (image, nodeSelector,
+tolerations, resources, log filter); the security context and hostPath
+mounts are contracts, not configuration, and are fixed in the template.
+
 The DaemonSet mounts three host paths: the kubelet device-plugin socket
 directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
