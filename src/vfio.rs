@@ -89,13 +89,29 @@ pub fn discover(
 }
 
 /// 10de:2330 → "nvidia.com/GH100_H100_SXM5_80GB"; ids the PCI database does
-/// not know fall back to the row's own name, so a stale database degrades to
-/// the generic resource instead of breaking.
+/// not know — or whose name sanitizes to nothing usable — fall back to the
+/// row's own name, so a bad database entry degrades to the generic resource
+/// instead of producing a name the kubelet rejects.
 fn sku_name(row: &Resource, dev: &IommufdDev) -> String {
     let domain = row.name.split('/').next().unwrap_or("nvidia.com");
     dev.device_name()
-        .map(|n| format!("{domain}/{}", sanitize(n)))
+        .and_then(sku_segment)
+        .map(|s| format!("{domain}/{s}"))
         .unwrap_or_else(|| row.name.to_owned())
+}
+
+/// Extended-resource names must start and end alphanumeric and the name part
+/// is capped at 63 chars, so trim stray underscores and truncate; None if
+/// nothing survives sanitization.
+fn sku_segment(raw: &str) -> Option<String> {
+    let s = sanitize(raw);
+    let s = s.trim_matches('_');
+    if s.is_empty() {
+        return None;
+    }
+    // sanitize() output is pure ASCII, so byte truncation is safe.
+    let s = &s[..s.len().min(63)];
+    Some(s.trim_matches('_').to_owned())
 }
 
 /// kubevirt-gpu-device-plugin compatible sanitization, so SKU names match
@@ -253,6 +269,16 @@ mod tests {
     fn missing_devices_dir_is_empty() {
         let root = TempDir::new().unwrap();
         assert!(discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias).is_empty());
+    }
+
+    #[test]
+    fn sku_segment_rejects_degenerate_names() {
+        assert_eq!(sku_segment("###"), None);
+        assert_eq!(sku_segment("  "), None);
+        assert_eq!(sku_segment("._x_."), Some("X".to_owned()));
+        // 63-char cap, no trailing underscore left by the cut.
+        let long = format!("{}_TAIL", "A".repeat(62));
+        assert_eq!(sku_segment(&long), Some("A".repeat(62)));
     }
 
     #[test]

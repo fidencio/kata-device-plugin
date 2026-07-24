@@ -4,6 +4,7 @@ use kata_device_plugin::{plugin, vfio};
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use plugin::DeviceServer;
 use tokio_util::sync::CancellationToken;
@@ -22,12 +23,15 @@ fn parse_naming() -> anyhow::Result<vfio::Naming> {
     Ok(naming)
 }
 
-/// Spawn one DeviceServer for `name`, tracked in `running`/`tasks`.
+/// Spawn one DeviceServer for `name`.  The task removes itself from
+/// `running` on exit, so a server that dies (bind failure, transient FS
+/// error) is respawned by the rescan loop instead of being lost until the
+/// pod restarts.
 fn spawn_server(
     name: &str,
     naming: vfio::Naming,
     shutdown: &CancellationToken,
-    running: &mut HashSet<String>,
+    running: &Arc<Mutex<HashSet<String>>>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     info!(resource = %name, "starting plugin");
@@ -41,13 +45,15 @@ fn spawn_server(
     );
     let token = shutdown.clone();
     let label = name.to_owned();
+    let set = running.clone();
+    running.lock().unwrap().insert(name.to_owned());
     tasks.push(tokio::spawn(async move {
         if let Err(e) = server.run(token).await {
             // {:#} keeps the error's cause chain; bare Display drops it.
             tracing::warn!(resource = %label, "plugin error: {e:#}");
         }
+        set.lock().unwrap().remove(&label);
     }));
-    running.insert(name.to_owned());
 }
 
 #[tokio::main]
@@ -74,33 +80,29 @@ async fn main() -> anyhow::Result<()> {
         sd.cancel();
     });
 
-    let mut running: HashSet<String> = HashSet::new();
+    let running: Arc<Mutex<HashSet<String>>> = Arc::default();
     let mut tasks = Vec::new();
 
-    // Alias names are known up front: start their servers unconditionally so
-    // the kubelet sees the resource (with zero capacity if nothing is bound
-    // yet) regardless of deployment ordering.  SKU names only exist once a
-    // device is discovered, so sku mode relies on the rescan loop below.
-    if matches!(naming, vfio::Naming::Alias) {
-        for res in vfio::RESOURCES {
-            spawn_server(res.name, naming, &shutdown, &mut running, &mut tasks);
-        }
-    }
-
-    // Rescan loop: a resolved name that appears later (VFIO binding racing
-    // the DaemonSet rollout; in sku mode, the first device of a new SKU)
-    // gets its server spawned within one tick.  Servers are never stopped —
-    // a name whose devices vanish keeps advertising zero capacity via its
-    // own ListAndWatch poller.
+    // Reconcile loop: spawn a server for every name that should exist but
+    // has none running.  Alias row names are always desired so the kubelet
+    // sees the resource (zero capacity included) regardless of deployment
+    // ordering; SKU names only exist once a device is discovered.  Servers
+    // are never stopped — a name whose devices vanish keeps advertising
+    // zero capacity via its own ListAndWatch poller.
     loop {
-        let discovered = vfio::discover(
+        let mut desired: Vec<String> = vfio::discover(
             Path::new(vfio::VFIO_DIR),
             Path::new(vfio::SYSFS_DIR),
             naming,
-        );
-        for name in discovered.keys() {
-            if !running.contains(name) {
-                spawn_server(name, naming, &shutdown, &mut running, &mut tasks);
+        )
+        .into_keys()
+        .collect();
+        if matches!(naming, vfio::Naming::Alias) {
+            desired.extend(vfio::RESOURCES.iter().map(|r| r.name.to_owned()));
+        }
+        for name in desired {
+            if !running.lock().unwrap().contains(&name) {
+                spawn_server(&name, naming, &shutdown, &running, &mut tasks);
             }
         }
         tokio::select! {
