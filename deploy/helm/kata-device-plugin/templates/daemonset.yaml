@@ -37,6 +37,13 @@ spec:
         - name: kata-device-plugin
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not (has .Values.resourceNaming (list "alias" "sku")) }}
+          {{- fail "resourceNaming must be \"alias\" or \"sku\"" }}
+          {{- end }}
+          {{- if ne .Values.resourceNaming "alias" }}
+          args:
+            - --resource-naming={{ .Values.resourceNaming }}
+          {{- end }}
           {{- with .Values.logFilter }}
           env:
             - name: RUST_LOG

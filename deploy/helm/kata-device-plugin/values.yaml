@@ -29,6 +29,11 @@ resources:
     cpu: 100m
     memory: 64Mi
 
+# alias: table names (nvidia.com/gpu).  sku: hardware identity
+# (nvidia.com/GH100_H100_SXM5_80GB).  alias passes no argument, so
+# images that predate the flag keep working.
+resourceNaming: alias
+
 # tracing_subscriber EnvFilter, e.g. "kata_device_plugin=debug".
 # Empty uses the binary's built-in default (kata_device_plugin=info).
 logFilter: ""
