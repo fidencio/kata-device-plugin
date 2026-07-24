@@ -18,7 +18,7 @@ proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
 build.rs       prost/tonic codegen from proto
 deploy/
-  daemonset.yaml
+  helm/kata-device-plugin/   the only deployment model
 ```
 
 ## Principles
