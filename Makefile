@@ -33,12 +33,12 @@ image:
 push:
 	docker push $(IMAGE):$(TAG)
 
-# Apply the DaemonSet to the current kubectl context.
+# Install into the current kubectl context.
 deploy:
-	kubectl apply -f deploy/daemonset.yaml
+	helm upgrade --install kata-device-plugin deploy/helm/kata-device-plugin -n kube-system
 
 undeploy:
-	kubectl delete --ignore-not-found -f deploy/daemonset.yaml
+	helm uninstall kata-device-plugin -n kube-system
 
 clean:
 	cargo clean

@@ -1,36 +1,55 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: kata-device-plugin
-  namespace: kube-system
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
   labels:
     app: kata-device-plugin
+    app.kubernetes.io/name: kata-device-plugin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{- /* semver build metadata (+) is not label-safe */}}
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | quote }}
 spec:
   selector:
     matchLabels:
       app: kata-device-plugin
+      app.kubernetes.io/instance: {{ .Release.Name }}
   updateStrategy:
     type: RollingUpdate
   template:
     metadata:
       labels:
         app: kata-device-plugin
+        app.kubernetes.io/name: kata-device-plugin
+        app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       priorityClassName: system-node-critical
-
-      # Only run on nodes where GFD has confirmed GPU presence.
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-        nvidia.com/gpu.present: "true"
-
-      # The plugin must start before workload pods on the node.
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
-        - operator: Exists
-          effect: NoSchedule
-
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: kata-device-plugin
-          image: kata-device-plugin:latest
-          imagePullPolicy: IfNotPresent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not (has .Values.resourceNaming (list "alias" "sku")) }}
+          {{- fail "resourceNaming must be \"alias\" or \"sku\"" }}
+          {{- end }}
+          {{- if ne .Values.resourceNaming "alias" }}
+          args:
+            - --resource-naming={{ .Values.resourceNaming }}
+          {{- end }}
+          {{- with .Values.logFilter }}
+          env:
+            - name: RUST_LOG
+              value: {{ . | quote }}
+          {{- end }}
 
           # No privileged flag, no added capabilities — ADR 10000.
           securityContext:
@@ -54,13 +73,10 @@ spec:
             - name: cdi
               mountPath: /var/run/cdi
 
+          {{- with .Values.resources }}
           resources:
-            requests:
-              cpu: 10m
-              memory: 20Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 
       volumes:
         - name: kubelet-socket

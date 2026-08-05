@@ -18,7 +18,7 @@ proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
 build.rs       prost/tonic codegen from proto
 deploy/
-  daemonset.yaml
+  helm/kata-device-plugin/   the only deployment model
 ```
 
 ## Principles
@@ -36,7 +36,7 @@ With `--resource-naming=sku` the advertised names carry the hardware identity in
 
 ## Label scheme
 
-The plugin reads no labels at runtime. The only label in play is `nvidia.com/gpu.present` (written by GFD), used as the DaemonSet `nodeSelector` so the plugin only lands on GPU nodes. Multi-node NVLink / IMEX orchestration is out of scope for this component — see ARCHITECTURE.md.
+The plugin reads no labels at runtime. The only label in play is `katacontainers.io/kata-runtime` (written by kata-deploy), used as the DaemonSet `nodeSelector` so the plugin lands on every Kata node. GPU labels (GFD's `nvidia.com/gpu.present`) are deliberately not used: on a passthrough node the device is VFIO-bound, the host driver never loads, and GFD never sees a GPU. Nodes without VFIO devices harmlessly advertise zero capacity. Multi-node NVLink / IMEX orchestration is out of scope for this component — see ARCHITECTURE.md.
 
 ## Building
 

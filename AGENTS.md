@@ -20,7 +20,7 @@ Read [CLAUDE.md](CLAUDE.md) first. This file adds agent-specific constraints on 
 | ADR | Code implication |
 | --- | --- |
 | 1000 | Device plugin only; no DRA driver |
-| 10000 | `deploy/daemonset.yaml` must stay non-privileged |
+| 10000 | the Helm chart DaemonSet must stay non-privileged |
 
 ## Testing
 
